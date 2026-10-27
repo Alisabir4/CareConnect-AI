@@ -3,7 +3,9 @@ from enum import Enum
 from pathlib import Path
 import json
 import os
+import tempfile
 import uuid
+from urllib.parse import quote
 
 from fastapi import Depends, FastAPI, HTTPException, UploadFile, File, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,23 +15,58 @@ from dotenv import load_dotenv
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, field_validator, Field
-from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, select, text
+from sqlalchemy import Boolean, Date, DateTime, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine, make_url, select, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
+from sqlalchemy.pool import NullPool
 from .report_service import analyze_text, answer_question, extract_pdf_text, normalize_text, ollama_available, processing_mode
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT.parent / ".env")
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{ROOT / 'careconnect.db'}")
-SECRET_KEY = os.getenv("JWT_SECRET", "local-development-secret-change-me")
+IS_VERCEL = os.getenv("VERCEL") == "1"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if IS_VERCEL and not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL must be configured for the Vercel deployment")
+DATABASE_URL = DATABASE_URL or f"sqlite:///{ROOT / 'careconnect.db'}"
+db_url = make_url(DATABASE_URL)
+IS_POSTGRES = db_url.drivername in {"postgres", "postgresql", "postgresql+psycopg"}
+if IS_VERCEL and not IS_POSTGRES:
+    raise RuntimeError("Vercel requires a persistent PostgreSQL DATABASE_URL; SQLite is local-only")
+if IS_POSTGRES:
+    db_url = db_url.set(drivername="postgresql+psycopg")
+    if "sslmode" not in db_url.query:
+        db_url = db_url.update_query_dict({"sslmode": "require"})
+    engine = create_engine(db_url, poolclass=NullPool, connect_args={"prepare_threshold": None, "connect_timeout": 10})
+else:
+    engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+configured_secret = os.getenv("JWT_SECRET")
+if IS_VERCEL and (not configured_secret or len(configured_secret) < 32):
+    raise RuntimeError("Set JWT_SECRET to a random value of at least 32 characters in Vercel")
+SECRET_KEY = configured_secret or "local-development-secret-change-me"
 ALGORITHM = "HS256"
 TOKEN_MINUTES = int(os.getenv("TOKEN_MINUTES", "60"))
-UPLOAD_DIR = ROOT / "uploads"
+frontend_origin_values = os.getenv("FRONTEND_ORIGINS", "" if IS_VERCEL else "http://localhost:5173")
+FRONTEND_ORIGINS = {origin.strip().rstrip("/") for origin in frontend_origin_values.split(",") if origin.strip()}
+for vercel_domain in (os.getenv("VERCEL_URL"), os.getenv("VERCEL_BRANCH_URL"), os.getenv("VERCEL_PROJECT_PRODUCTION_URL")):
+    if vercel_domain:
+        FRONTEND_ORIGINS.add("https://" + vercel_domain.strip().rstrip("/"))
+if IS_VERCEL and not FRONTEND_ORIGINS:
+    raise RuntimeError("Vercel did not provide a deployment origin; configure FRONTEND_ORIGINS explicitly")
+if "*" in FRONTEND_ORIGINS:
+    raise RuntimeError("FRONTEND_ORIGINS must list explicit origins; wildcard CORS is not allowed")
+UPLOAD_ROOT = Path(tempfile.gettempdir()) / "careconnect-ai" if IS_VERCEL else ROOT
+UPLOAD_DIR = UPLOAD_ROOT / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
-MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str((4 if IS_VERCEL else 10) * 1024 * 1024)))
 MAX_REPORT_BYTES = int(os.getenv("MAX_REPORT_BYTES", str(MAX_UPLOAD_BYTES)))
-REPORT_UPLOAD_DIR = ROOT / "report_uploads"
+if IS_VERCEL and max(MAX_UPLOAD_BYTES, MAX_REPORT_BYTES) > 4 * 1024 * 1024:
+    raise RuntimeError("Vercel request bodies are limited to 4.5 MB; set MAX_UPLOAD_BYTES and MAX_REPORT_BYTES to 4194304 or less")
+REPORT_UPLOAD_DIR = UPLOAD_ROOT / "report_uploads"
 REPORT_UPLOAD_DIR.mkdir(exist_ok=True)
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+SUPABASE_STORAGE_BUCKET = os.getenv("SUPABASE_STORAGE_BUCKET", "private-health-reports")
+if IS_VERCEL and (not SUPABASE_URL.startswith("https://") or not SUPABASE_SERVICE_ROLE_KEY):
+    raise RuntimeError("Configure SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY for private PDF storage")
 SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 pwd = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth = OAuth2PasswordBearer(tokenUrl="/api/v1/auth/login")
@@ -209,8 +246,36 @@ class AdminDoctorInput(BaseModel):
 def notify(db:Session,user_id:int,title:str,message:str,appointment_id:int|None=None):
     db.add(Notification(user_id=user_id,title=title,message=message,appointment_id=appointment_id))
 
+def _storage_object_url(object_key:str)->str:
+    if not object_key or Path(object_key).name != object_key or not object_key.endswith(".pdf"):
+        raise ValueError("Invalid generated storage key")
+    return f"{SUPABASE_URL}/storage/v1/object/{quote(SUPABASE_STORAGE_BUCKET, safe='')}/{quote(object_key, safe='')}"
+
+def store_private_pdf(object_key:str,data:bytes)->None:
+    import httpx
+    try:
+        response=httpx.post(_storage_object_url(object_key),headers={
+            "apikey":SUPABASE_SERVICE_ROLE_KEY,"Authorization":f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            "Content-Type":"application/pdf","x-upsert":"false"},content=data,timeout=20)
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError("Private PDF storage upload failed") from exc
+
+def delete_private_pdf(object_key:str)->None:
+    import httpx
+    try:
+        response=httpx.delete(f"{SUPABASE_URL}/storage/v1/object/{quote(SUPABASE_STORAGE_BUCKET, safe='')}",
+            headers={"apikey":SUPABASE_SERVICE_ROLE_KEY,"Authorization":f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"},
+            json={"prefixes":[object_key]},timeout=20)
+        if response.status_code != 404:
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise RuntimeError("Private PDF storage deletion failed") from exc
+
 app=FastAPI(title="CareConnect AI", version="1.0.0", description="Portfolio demonstration with fictional records; not medical advice.")
-app.add_middleware(CORSMiddleware, allow_origins=os.getenv("FRONTEND_ORIGINS","http://localhost:5173").split(","), allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(CORSMiddleware, allow_origins=sorted(FRONTEND_ORIGINS), allow_credentials=True,
+                   allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+                   allow_headers=["Authorization", "Content-Type"])
 @app.get("/api/v1/health")
 def health(): return {"status":"ok","demo_data":"fictional"}
 @app.post("/api/v1/auth/register", status_code=201)
@@ -305,15 +370,28 @@ def my_appointments(u=Depends(roles("patient")),db:Session=Depends(get_db)): ret
 async def upload_document(file:UploadFile=File(...),u=Depends(roles("patient")),db:Session=Depends(get_db)):
     if file.content_type!="application/pdf" or not file.filename.lower().endswith(".pdf"): raise HTTPException(415,"Upload a PDF document")
     data=await file.read(MAX_UPLOAD_BYTES+1)
-    if len(data)>MAX_UPLOAD_BYTES: raise HTTPException(413,"PDF must be 10 MB or smaller")
+    if len(data)>MAX_UPLOAD_BYTES: raise HTTPException(413,f"PDF must be {MAX_UPLOAD_BYTES // (1024*1024)} MB or smaller")
     if not data.startswith(b"%PDF-"): raise HTTPException(415,"File content is not a valid PDF")
     import fitz
-    safe=f"{u.id}_{uuid.uuid4().hex}.pdf"; path=UPLOAD_DIR/safe; path.write_bytes(data)
+    safe=f"{u.id}_{uuid.uuid4().hex}.pdf"; path=UPLOAD_DIR/safe
     try:
         with fitz.open(stream=data,filetype="pdf") as doc: extracted="\n".join(p.get_text() for p in doc).strip()
     except Exception:
-        path.unlink(missing_ok=True); raise HTTPException(415,"The uploaded PDF could not be read")
-    d=Document(owner_id=u.id,filename=Path(file.filename).name,path=safe,extracted_text=extracted); db.add(d); db.commit(); db.refresh(d)
+        raise HTTPException(415,"The uploaded PDF could not be read")
+    if IS_VERCEL:
+        try: await run_in_threadpool(store_private_pdf,safe,data)
+        except RuntimeError: raise HTTPException(503,"Private PDF storage is unavailable")
+    else: path.write_bytes(data)
+    d=Document(owner_id=u.id,filename=Path(file.filename).name,path=safe,extracted_text=extracted)
+    try:
+        db.add(d); db.commit(); db.refresh(d)
+    except Exception:
+        db.rollback()
+        try:
+            if IS_VERCEL: await run_in_threadpool(delete_private_pdf,safe)
+            else: path.unlink(missing_ok=True)
+        except (RuntimeError,ValueError): pass
+        raise HTTPException(500,"Document could not be saved")
     return {"id":d.id,"filename":d.filename,"status":"processed" if extracted else "no_text","message":"Text extracted" if extracted else "No selectable text found; this scanned PDF requires OCR."}
 @app.get("/api/v1/documents")
 def list_documents(u=Depends(current_user),db:Session=Depends(get_db)):
@@ -335,7 +413,11 @@ def delete_document(did:int,u=Depends(current_user),db:Session=Depends(get_db)):
     d=db.get(Document,did)
     if not d or (u.role=="patient" and d.owner_id!=u.id): raise HTTPException(404,"Document not found")
     if u.role=="doctor": raise HTTPException(403,"Not authorized")
-    (UPLOAD_DIR/d.path).unlink(missing_ok=True); db.delete(d); db.commit(); return {"deleted":True}
+    if IS_VERCEL:
+        try: delete_private_pdf(d.path)
+        except (RuntimeError,ValueError): raise HTTPException(503,"Private PDF storage is unavailable")
+    else: (UPLOAD_DIR/d.path).unlink(missing_ok=True)
+    db.delete(d); db.commit(); return {"deleted":True}
 
 def report_out(report:MedicalReport):
     return {"id":report.id,"filename":report.filename,"created_at":report.created_at.isoformat(),"status":report.status}
@@ -367,13 +449,21 @@ async def upload_report(file:UploadFile=File(...),u=Depends(roles("patient")),db
         raise HTTPException(415,"The uploaded PDF could not be read")
     if not extracted: raise HTTPException(422,"No selectable text was found. Scanned PDFs need OCR, which is not available in this demo.")
     # Never return the storage path/key or log extracted health text.
-    path.write_bytes(data)
+    if IS_VERCEL:
+        try: await run_in_threadpool(store_private_pdf,storage_key,data)
+        except RuntimeError: raise HTTPException(503,"Private PDF storage is unavailable")
+    else: path.write_bytes(data)
     report=MedicalReport(owner_id=u.id,filename=filename[:255],storage_key=storage_key,
                          extracted_text=extracted,analysis_json=json.dumps(analyze_text(extracted)),status="processed")
     try:
         db.add(report); db.commit(); db.refresh(report)
     except Exception:
-        db.rollback(); path.unlink(missing_ok=True); raise HTTPException(500,"Report could not be saved")
+        db.rollback()
+        try:
+            if IS_VERCEL: await run_in_threadpool(delete_private_pdf,storage_key)
+            else: path.unlink(missing_ok=True)
+        except (RuntimeError,ValueError): pass
+        raise HTTPException(500,"Report could not be saved")
     return {**report_out(report),"processing_mode":processing_mode(),"message":"Report text extracted locally"}
 
 @app.get("/api/v1/reports",response_model=list[ReportOut])
@@ -429,10 +519,13 @@ def clear_report_chat(report_id:int,u=Depends(roles("patient")),db:Session=Depen
 @app.delete("/api/v1/reports/{report_id}")
 def delete_report(report_id:int,u=Depends(roles("patient")),db:Session=Depends(get_db)):
     report=owned_report(report_id,u,db); storage_key=report.storage_key
+    if IS_VERCEL:
+        try: delete_private_pdf(storage_key)
+        except (RuntimeError,ValueError): raise HTTPException(503,"Private PDF storage is unavailable")
     db.query(ReportMessage).filter_by(report_id=report.id,owner_id=u.id).delete(synchronize_session=False)
     db.delete(report); db.commit()
     # Storage identifiers are generated by the server and constrained to basenames.
-    (REPORT_UPLOAD_DIR/Path(storage_key).name).unlink(missing_ok=True)
+    if not IS_VERCEL: (REPORT_UPLOAD_DIR/Path(storage_key).name).unlink(missing_ok=True)
     return {"deleted":True}
 
 @app.put("/api/v1/appointments/{aid}/notes")

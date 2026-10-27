@@ -42,7 +42,7 @@ def extract_pdf_text(payload: bytes, max_chars: int = MAX_REPORT_CHARS, max_page
 RESULT_LINE = re.compile(
     r"^(?P<name>[A-Za-z][A-Za-z0-9 /()%.,_-]{1,55}?)\s+"
     r"(?P<value>[<>≤≥]?\s*-?\d+(?:[.,]\d+)?)\s*"
-    r"(?P<unit>%|mg/dL|g/dL|mg/L|g/L|mmol/L|mEq/L|µ?mol/L|(?:x\s*)?10\^?\d+(?:\s*/\s*(?:µ?L|uL|L))?|[KkMm]\s*/\s*(?:µ?L|uL)|cells\s*/\s*(?:µ?L|uL)|U/L|IU/L|fL|pg|ng/mL)?"
+    r"(?P<unit>%|mg/dL|g/dL|mg/L|g/L|mmol/L|mEq/L|µ?mol/L|(?:[x×]\s*)?10(?:\^?\d+|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)(?:\s*/\s*(?:µ?L|uL|L))?|[KkMm]\s*/\s*(?:µ?L|uL)|cells\s*/\s*(?:µ?L|uL)|U/L|IU/L|fL|pg|ng/mL)?"
     r"\s*(?:\((?:ref(?:erence)?)?\s*)?(?P<low>-?\d+(?:[.,]\d+)?)\s*[-–]\s*"
     r"(?P<high>-?\d+(?:[.,]\d+)?)(?:\s*\))?\s*(?P<flag>H|L|HIGH|LOW|ABNORMAL)?\s*$",
     re.IGNORECASE,
@@ -50,7 +50,7 @@ RESULT_LINE = re.compile(
 VALUE_LINE = re.compile(
     r"^(?P<name>[A-Za-z][A-Za-z0-9 /()%.,_-]{1,55}?)\s+"
     r"(?P<value>[<>≤≥]?\s*-?\d+(?:[.,]\d+)?)\s*"
-    r"(?P<unit>%|mg/dL|g/dL|mg/L|g/L|mmol/L|mEq/L|µ?mol/L|(?:x\s*)?10\^?\d+(?:\s*/\s*(?:µ?L|uL|L))?|[KkMm]\s*/\s*(?:µ?L|uL)|cells\s*/\s*(?:µ?L|uL)|U/L|IU/L|fL|pg|ng/mL)?"
+    r"(?P<unit>%|mg/dL|g/dL|mg/L|g/L|mmol/L|mEq/L|µ?mol/L|(?:[x×]\s*)?10(?:\^?\d+|[⁰¹²³⁴⁵⁶⁷⁸⁹]+)(?:\s*/\s*(?:µ?L|uL|L))?|[KkMm]\s*/\s*(?:µ?L|uL)|cells\s*/\s*(?:µ?L|uL)|U/L|IU/L|fL|pg|ng/mL)?"
     r"(?:\s+(?P<flag>H|L|HIGH|LOW|ABNORMAL))?\s*$",
     re.IGNORECASE,
 )
@@ -169,6 +169,8 @@ def processing_mode() -> str:
 
 _RESULT_PREFIX = re.compile(r"^\s*(?P<name>[A-Za-z][A-Za-z0-9 /()%.,_-]{1,55}?)\s+(?P<value>[<>≤≥]?\s*-?\d+(?:[.,]\d+)?)")
 _OUT_OF_RANGE_QUESTION = re.compile(r"\b(outside|out\s+of\s+range|out-of-range|abnormal|high|low|above|below|flagged|elevated)\b", re.I)
+_URDU_REQUEST = re.compile(r"\burdu\b|اردو", re.I)
+_NORMAL_RESULTS_REQUEST = re.compile(r"\bnormal\b|\bwithin(?:\s+the)?\s+range\b|نارمل", re.I)
 _NON_RESULT_LABELS = {"date", "legend", "page", "patient", "printed", "reference", "range", "result", "status", "test", "unit"}
 _STOP_WORDS = {"a", "an", "and", "are", "as", "at", "be", "does", "for", "from", "how", "i", "in", "is", "it", "me", "my", "of", "on", "or", "please", "result", "results", "report", "test", "tests", "the", "this", "to", "was", "what", "when", "where", "which", "with", "range", "ranges", "reference"}
 
@@ -225,7 +227,11 @@ def retrieve(text: str, question: str, limit: int = 5) -> list[str]:
     if asks_outside:
         # An abnormal result is returned only when this row contains a numeric
         # comparison range or the lab itself marks it high/low/abnormal.
-        return [line for line in candidates if _line_is_marked_outside(line)][:limit]
+        outside = [line for line in candidates if _line_is_marked_outside(line)]
+        if _NORMAL_RESULTS_REQUEST.search(question):
+            normal = [line for line in candidates if any(row["status"] == "within" for row in parse_results(line))]
+            return (outside + [line for line in normal if line not in outside])[:max(limit, min(20, len(outside) + len(normal)))]
+        return outside[:limit]
 
     def score(line: str) -> tuple[int, int]:
         words = {w.lower() for w in re.findall(r"[\w.-]+", line)}
@@ -246,11 +252,45 @@ def answer_question(text: str, question: str, history: list[dict] | None = None)
     prior_questions = [item.get("content", "")[:300] for item in recent_history if item.get("role") == "user"]
     excerpts = retrieve(text, " ".join(prior_questions[-2:] + [question]))
     if not excerpts:
+        if _URDU_REQUEST.search(question):
+            answer = ("اس رپورٹ میں ایسا ٹیسٹ نتیجہ نہیں ملا جس پر اسی سطر میں واضح زیادہ/کم کا نشان یا حوالہ حد سے باہر عدد موجود ہو۔ میں غائب قدر یا حد کا اندازہ نہیں لگاؤں گا؛ اصل رپورٹ صحت کے ماہر سے دیکھیں۔"
+                      if _OUT_OF_RANGE_QUESTION.search(question) else
+                      "اس رپورٹ میں اس سوال کے لیے قابلِ استعمال معلومات نہیں ملیں۔ میں غائب نتائج کا اندازہ نہیں لگاؤں گا؛ صحت کے ماہر سے رجوع کریں۔")
+            return {"answer": answer, "evidence": [], "processing_mode": "Local rules and retrieval"}
         answer = ("I couldn't identify a test row with an explicit high/low flag or a value outside a reference range printed on that row. I won't infer missing values or ranges; please check the source report with your healthcare professional."
                   if _OUT_OF_RANGE_QUESTION.search(question) else
                   "I couldn't find that information in this report. I won't infer missing results; please check with your healthcare professional.")
         return {"answer": answer,
                 "evidence": [], "processing_mode": processing_mode()}
+    if _URDU_REQUEST.search(question):
+        rows = [row for excerpt in excerpts for row in parse_results(excerpt)]
+        abnormal = [row for row in rows if row["status"] in {"outside_high", "outside_low"}]
+        normal = [row for row in rows if row["status"] == "within"]
+        names = {"wbc": "سفید خون کے خلیات (WBC)", "neutrophils": "نیوٹروفلز", "lymphocytes": "لمفوسائٹس",
+                 "crp": "سی آر پی (CRP)", "platelets": "پلیٹلیٹس"}
+        def format_row(row: dict) -> str:
+            name = row["name"]
+            label = names.get(name.casefold(), name)
+            unit = (row["unit"] if row["unit"] == "%" else f" {row['unit']}") if row["unit"] else ""
+            reference = f"؛ حوالہ حد: {row['reference_range']}" if row["reference_range"] else ""
+            if row["status"] == "outside_high":
+                status = "زیادہ"
+            elif row["status"] == "outside_low":
+                status = "کم"
+            else:
+                status = "درج شدہ حد کے اندر"
+            return f"• {label}: {row['value']}{unit}{reference} — {status}۔"
+        sections = ["رپورٹ کا سادہ خلاصہ:"]
+        if abnormal:
+            sections.extend(["غیر معمولی نتائج:", *(format_row(row) for row in abnormal)])
+        if normal:
+            sections.extend(["نارمل نتائج:", *(format_row(row) for row in normal)])
+        if not abnormal and not normal:
+            sections.append("ملنے والی سطروں سے نتائج کو نارمل یا غیر معمولی قرار دینے کے لیے کافی معلومات نہیں ہیں۔")
+        if re.search(r"\bfever\b|بخار", question, re.I):
+            sections.append("یہ نتائج اکیلے بخار کی قطعی وجہ کی تصدیق نہیں کر سکتے۔ وجہ سمجھنے کے لیے علامات، معائنہ اور ڈاکٹر کی تشخیص ضروری ہیں۔")
+        sections.append("یہ صرف رپورٹ میں درج معلومات کا خلاصہ ہے، تشخیص نہیں۔")
+        return {"answer": "\n".join(sections), "evidence": excerpts, "processing_mode": "Local rules and retrieval"}
     config = ollama_config()
     if config and ollama_available():
         try:

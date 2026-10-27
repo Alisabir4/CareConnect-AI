@@ -79,6 +79,7 @@ pnpm-debug.log*
 *~
 .idea/
 .vscode/
+.vercel/
 .DS_Store
 Thumbs.db
 Desktop.ini

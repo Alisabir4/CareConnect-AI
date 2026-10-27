@@ -1,11 +1,13 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { AlertCircle, FileText, LoaderCircle, MessageCircle, Plus, ShieldCheck, Trash2, UploadCloud } from 'lucide-react';
+import { usableEvidence } from './reportChat.js';
 
-const API = import.meta.env.VITE_API_URL || 'http://localhost:8000/api/v1';
-const MAX_BYTES = 10 * 1024 * 1024;
+const API = import.meta.env.VITE_API_URL;
+const MAX_BYTES = Number(import.meta.env.VITE_MAX_UPLOAD_BYTES || (import.meta.env.MODE === 'production' ? 4 : 10) * 1024 * 1024);
 
 async function request(path, token, options = {}) {
+  if (!API) throw new Error('Set VITE_API_URL to the backend API base URL');
   const response = await fetch(`${API}${path}`, {
     ...options,
     headers: { ...(options.body instanceof FormData ? {} : { 'Content-Type': 'application/json' }), Authorization: `Bearer ${token}`, ...options.headers },
@@ -56,7 +58,7 @@ export default function HealthReportAnalyzer({ user, token, notify }) {
     if (!file || busy || busyRef.current) return;
     setError('');
     if (!file.name.toLowerCase().endsWith('.pdf') || file.type !== 'application/pdf') { setError('Choose a PDF file.'); return; }
-    if (file.size > MAX_BYTES) { setError('The PDF must be 10 MB or smaller.'); return; }
+    if (file.size > MAX_BYTES) { setError(`The PDF must be ${Math.floor(MAX_BYTES / 1048576)} MB or smaller.`); return; }
     busyRef.current = true; setBusy(true);
     try {
       const body = new FormData(); body.append('file', file);
@@ -107,7 +109,7 @@ export default function HealthReportAnalyzer({ user, token, notify }) {
   return <main className="page wrap reportPage">
     <div className="crumb"><Link to="/dashboard">Dashboard</Link> <span aria-hidden="true">›</span> AI Health Report Analyzer</div>
     <div className="pageTitle"><div><div className="eyebrow">YOUR PRIVATE HEALTH LIBRARY</div><h1>AI Health Report Analyzer</h1><p>Understand the text in a lab report with local rules and evidence from your document.</p></div><span className="demoPill"><ShieldCheck size={14}/> {mode}</span></div>
-    <div className="infoBanner"><ShieldCheck/><span>For understanding a document only. This feature does not diagnose, recommend treatment, or replace a healthcare professional. Out-of-range values alone do not establish disease. Reports stay in this local app and are not sent to a cloud AI service.</span></div>
+          <div className="infoBanner"><ShieldCheck/><span>For understanding a document only. This feature does not diagnose, recommend treatment, or replace a healthcare professional. Out-of-range values alone do not establish disease. In production, PDFs use private server-managed storage; report text is not sent to a cloud AI service.</span></div>
     {error && <div className="errorBox" role="alert"><AlertCircle size={17}/>{error}</div>}
 
     <div className="reportGrid">
@@ -116,7 +118,7 @@ export default function HealthReportAnalyzer({ user, token, notify }) {
           <div className="eyebrow">ADD A REPORT</div><h2>Upload a laboratory PDF</h2>
           <div className={`dropZone ${dragging ? 'dragging' : ''}`} onDragOver={e => { e.preventDefault(); setDragging(true); }} onDragLeave={() => setDragging(false)} onDrop={e => { e.preventDefault(); setDragging(false); upload(e.dataTransfer.files?.[0]); }}>
             {busy ? <LoaderCircle className="spin"/> : <UploadCloud/>}
-            <b>{busy ? 'Processing report…' : 'Drop your PDF here'}</b><small>or choose a file · PDF · up to 10 MB</small>
+            <b>{busy ? 'Processing report…' : 'Drop your PDF here'}</b><small>or choose a file · {'PDF · up to ' + Math.floor(MAX_BYTES / 1048576) + ' MB'}</small>
             <button className="button small" disabled={busy} type="button" onClick={() => inputRef.current?.click()}>Choose PDF</button>
             <input ref={inputRef} hidden type="file" accept="application/pdf,.pdf" aria-label="Choose a laboratory report PDF" onChange={e => upload(e.target.files?.[0])}/>
           </div>
@@ -140,7 +142,7 @@ export default function HealthReportAnalyzer({ user, token, notify }) {
           <section className="contentCard analysisCard"><div className="eyebrow">VALUES OUTSIDE A STATED RANGE</div><h2>Values marked outside range</h2>{analysis.outside_range?.length ? <ul>{analysis.outside_range.map((r,i)=><li key={i}><b>{r.name}: {r.value} {r.unit}</b> — {r.status === 'outside_high' ? 'above' : 'below'} the range stated on this line ({r.reference_range}).</li>)}</ul> : <p>No values were confidently identified as outside a stated range. This does not mean results are clinically normal or that the report is complete.</p>}</section>
           <section className="contentCard analysisCard"><div className="eyebrow">PLAIN LANGUAGE</div><h2>What some terms mean</h2>{analysis.term_explanations?.length ? <ul>{analysis.term_explanations.map(x=><li key={x.term}><b>{x.term}</b> — {x.meaning}</li>)}</ul> : <p>No glossary terms were confidently identified. Ask your healthcare professional to explain unfamiliar terms in context.</p>}<h3>Questions to discuss with a healthcare professional</h3><ul>{analysis.questions_for_clinician?.map(q=><li key={q}>{q}</li>)}</ul><h3>Missing or unclear information</h3><ul>{analysis.missing_or_unclear?.map(q=><li key={q}>{q}</li>)}</ul></section>
           <section className="contentCard reportChat"><div className="cardTitle"><div><div className="eyebrow">REPORT-BASED FOLLOW-UP</div><h2><MessageCircle size={17}/> Ask about this report</h2></div><button className="textbtn" onClick={clearChat} disabled={busy}>New conversation</button></div><p className="muted">Answers retrieve matching excerpts from this report only. Local retrieval is keyword based and does not interpret clinical meaning.</p>
-            <div className="chatMessages" aria-live="polite">{messages.length ? messages.map((m,i)=><article className={`chatMessage ${m.role}`} key={m.id || `${m.role}-${i}`}><b>{m.role === 'user' ? 'You' : 'Report assistant'}</b><p>{m.content}</p>{m.evidence?.length > 0 && <details><summary>Report evidence</summary><ul>{m.evidence.map((s,j)=><li key={j}>{s}</li>)}</ul></details>}</article>) : <div className="chatEmpty">Try: “Which values are marked high or low by the lab?”</div>}<div ref={chatEnd}/></div>
+            <div className="chatMessages" aria-live="polite">{messages.length ? messages.map((m,i)=>{const evidence=usableEvidence(m.evidence);return <article className={`chatMessage ${m.role}`} key={m.id || `${m.role}-${i}`}><b>{m.role === 'user' ? 'You' : 'Report assistant'}</b><p>{m.content}</p>{evidence.length > 0 && <details><summary>Report evidence</summary><ul>{evidence.map((s,j)=><li key={j}>{s}</li>)}</ul></details>}</article>}) : <div className="chatEmpty">Try: “Which values are marked high or low by the lab?”</div>}<div ref={chatEnd}/></div>
             <form className="reportChatForm" onSubmit={sendQuestion}><label className="srOnly" htmlFor="report-question">Ask a question about this report</label><input id="report-question" value={question} onChange={e=>setQuestion(e.target.value)} placeholder="Ask a question about this report…" maxLength={1000} disabled={busy}/><button className="button small" disabled={busy || !question.trim()}>{busy ? 'Working…' : 'Ask'}</button></form>
             <small className="medicalDisclaimer">{analysis.disclaimer}</small>
           </section>

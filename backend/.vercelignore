@@ -1,0 +1,13 @@
+# Keep local databases, user documents, trained artifacts and test artifacts out of functions.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+uploads/
+report_uploads/
+models/*.joblib
+models/metrics.json
+tests/
+__pycache__/
+*.py[cod]
+.pytest_cache/

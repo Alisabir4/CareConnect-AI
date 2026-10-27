@@ -2,6 +2,8 @@ import uuid
 from datetime import datetime
 
 import fitz
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from app import main
@@ -163,6 +165,77 @@ def test_out_of_range_question_reports_insufficient_evidence_when_range_or_flag_
     assert response["evidence"]==[]
     assert "couldn't identify" in response["answer"]
     assert "won't infer missing values or ranges" in response["answer"]
+
+
+def test_simple_urdu_answer_uses_report_rows_and_explains_fever_limit():
+    report=("WBC 11.8 ×10⁹/L 4.0-11.0 H\n"
+            "Neutrophils 78% 40-75 H\n"
+            "Lymphocytes 15% 20-45 L\n"
+            "CRP 18 mg/L 0-5 H")
+    question=("Is report ko simple Urdu mein summarize karo. Har abnormal result ki value aur reference range batao, "
+              "normal results ko alag mention karo, aur explain karo ke kya is report se fever ki exact wajah confirm ho sakti hai")
+    response=answer_question(report,question)
+    answer=response["answer"]
+    assert "غیر معمولی نتائج" in answer
+    assert "WBC" in answer and "11.8 ×10⁹/L" in answer and "4.0–11.0" in answer and "زیادہ" in answer
+    assert "نیوٹروفلز" in answer and "78%" in answer and "40–75" in answer
+    assert "لمفوسائٹس" in answer and "15%" in answer and "20–45" in answer and "کم" in answer
+    assert "سی آر پی (CRP)" in answer and "18 mg/L" in answer and "0–5" in answer
+    assert "نارمل نتائج:" not in answer
+    assert "بخار کی قطعی وجہ" in answer and "تصدیق نہیں کر سکتے" in answer
+    assert len(response["evidence"])==4
+
+
+def test_urdu_answer_lists_normal_rows_only_when_report_evidence_contains_them():
+    report="Glucose 86 mg/dL 70-99\nCRP 18 mg/L 0-5 H"
+    question="Simple Urdu: abnormal aur normal results batao"
+    answer=answer_question(report,question)["answer"]
+    assert "غیر معمولی نتائج" in answer and "CRP" in answer
+    assert "نارمل نتائج:" in answer and "Glucose: 86 mg/dL" in answer
+    missing=answer_question("Legend: normal means okay", question)
+    assert missing["evidence"]==[]
+    assert "نارمل نتائج:" not in missing["answer"]
+    assert "غیر معمولی نتائج:" not in missing["answer"]
+
+
+def test_english_report_question_remains_english():
+    answer=answer_question("WBC 11.8 ×10⁹/L 4.0-11.0 H", "Which results are abnormal?")["answer"]
+    assert "These report rows" in answer
+    assert "غیر معمولی نتائج" not in answer
+
+
+def test_private_pdf_storage_uses_server_credentials_and_generated_keys(monkeypatch):
+    monkeypatch.setattr(main,"SUPABASE_URL","https://fictional-project.supabase.co")
+    monkeypatch.setattr(main,"SUPABASE_SERVICE_ROLE_KEY","server-only-test-key")
+    monkeypatch.setattr(main,"SUPABASE_STORAGE_BUCKET","private-health-reports")
+    requests=[]
+    def fake_post(url,**kwargs):
+        requests.append((url,kwargs))
+        return httpx.Response(200,request=httpx.Request("POST",url))
+    monkeypatch.setattr(httpx,"post",fake_post)
+    main.store_private_pdf("generated_123.pdf",b"%PDF-fictional")
+    url,kwargs=requests[0]
+    assert url=="https://fictional-project.supabase.co/storage/v1/object/private-health-reports/generated_123.pdf"
+    assert kwargs["headers"]["Authorization"]=="Bearer server-only-test-key"
+    assert kwargs["headers"]["x-upsert"]=="false"
+    assert kwargs["content"]==b"%PDF-fictional"
+    with pytest.raises(ValueError): main.store_private_pdf("../private.pdf",b"%PDF-fictional")
+
+
+def test_private_pdf_deletion_uses_storage_api_object_removal(monkeypatch):
+    monkeypatch.setattr(main,"SUPABASE_URL","https://fictional-project.supabase.co")
+    monkeypatch.setattr(main,"SUPABASE_SERVICE_ROLE_KEY","server-only-test-key")
+    monkeypatch.setattr(main,"SUPABASE_STORAGE_BUCKET","private-health-reports")
+    calls=[]
+    def fake_delete(url,**kwargs):
+        calls.append((url,kwargs))
+        return httpx.Response(200,request=httpx.Request("DELETE",url))
+    monkeypatch.setattr(httpx,"delete",fake_delete)
+    main.delete_private_pdf("generated_123.pdf")
+    url,kwargs=calls[0]
+    assert url=="https://fictional-project.supabase.co/storage/v1/object/private-health-reports"
+    assert kwargs["json"]=={"prefixes":["generated_123.pdf"]}
+    assert kwargs["headers"]["Authorization"]=="Bearer server-only-test-key"
 
 
 def test_report_routes_are_documented_with_request_and_response_schemas():

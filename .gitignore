@@ -1,0 +1,84 @@
+# Local environment files and credentials. Safe templates remain committable.
+.env
+.env.*
+!.env.example
+!.env.*.example
+.envrc
+.npmrc
+!.npmrc.example
+.pypirc
+.netrc
+*.token
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.crt
+*.cer
+secrets/
+.secrets/
+
+# Python environments and generated test/cache output.
+.venv/
+venv/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Frontend dependencies and generated build/test output.
+node_modules/
+dist/
+frontend/.vite/
+coverage/
+
+# Local databases and SQLite sidecars.
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+
+# Private uploaded files; retain source and safe fixtures outside these paths.
+backend/careconnect.db
+backend/uploads/
+backend/report_uploads/
+/careconnect.db
+/uploads/
+
+# Locally trained models and model caches. Training code and manifests stay tracked.
+backend/models/*.joblib
+backend/models/metrics.json
+.cache/
+.model_cache/
+model_cache/
+ollama_models/
+huggingface_cache/
+*.safetensors
+
+# Logs, temporary files, editor state and OS metadata.
+logs/
+*.log
+*.log.*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tmp
+*.temp
+*.pid
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
